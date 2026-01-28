@@ -3,9 +3,9 @@
 #include <ArduinoJson.h>
 #include <vector> 
 
-const char* ssid = "Zoltu";
-char* password = "1029384756";
-const char* mqtt_server = "192.168.50.47";
+const char* ssid = "";
+char* password = "";
+const char* mqtt_server = "";
 
 WiFiClient espClient;
 PubSubClient mqttClient(espClient);
