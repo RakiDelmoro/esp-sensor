@@ -10,13 +10,22 @@ const char* mqtt_server = "";
 WiFiClient espClient;
 PubSubClient mqttClient(espClient);
 
-std::vector<int> sensorReads;
+struct FlowWithTimeAccumulator {
+  unsigned long totalTimeMs = 0;
+  unsigned long totalPulses = 0;
+};
 
-const int flowSensorPin = D2;
-volatile unsigned long pulse = 0;
+FlowWithTimeAccumulator offlineAcc;
+
+const float PULSES_PER_LITER = 60;
+unsigned long lastSampleTime = 0;
+
+const int flowSensorPin = 25;
+volatile unsigned long pulses = 0;
+unsigned long lastPulses = 0;
 
 void IRAM_ATTR increase() {
-  pulse++;
+  pulses++;
 }
 
 void wifiStatus() {
@@ -30,48 +39,68 @@ void wifiStatus() {
 
 void mqttStatus() {
   if (WiFi.status() == WL_CONNECTED && !mqttClient.connected()) {
-    mqttClient.connect("test-sensor", "mqtt_indicator_1", "mqtt")
+    mqttClient.connect("test-sensor", "mqtt_indicator_1", "mqtt");
     Serial.println("Connecting to MQTT...");
-    if mqttClient.connected() {
+    if (mqttClient.connected()) {
       Serial.println("MQTT connected");
     }
   }
 }
 
-void readAndStore() {
-  noInterrupts();
-  unsigned int count = pulse;
-  pulse = 0;
-  interrupts();
+void readTotalTimeAndPulse() {
+  if (millis() < lastSampleTime + 1000) return;
 
-  sensorReads.push_back(count);
+  unsigned long currentPulses;
+  noInterrupts();
+  currentPulses = pulses;
+  interrupts();
+  
+  unsigned long now = millis();
+  unsigned long pulsesSinceLastRead = currentPulses - lastPulses;
+  unsigned long timeSinceLastRead = now - lastSampleTime;
+
+  lastPulses = currentPulses;
+  lastSampleTime = now;
+
+  offlineAcc.totalTimeMs += timeSinceLastRead;
+  offlineAcc.totalPulses += pulsesSinceLastRead;
 }
 
 void publishSensorReads() {
-  if (sensorReads.empty() || !mqttClient.connected()) return;
+  if (offlineAcc.totalTimeMs == 0 || !mqttClient.connected()) return;
 
-  StaticJsonDocument<256> doc;
-  JsonArray array = doc.to<JsonArray>();
-  for (int v : sensorReads) {
-    array.add(v);
+  const float pulsesPerLiter = 60.0;
+
+  float totalLiters = offlineAcc.totalPulses / pulsesPerLiter;
+  float totalMinutes = offlineAcc.totalTimeMs / 60000.0;
+  float flowRateLpm = totalLiters / totalMinutes;
+
+  char payload[64];
+  snprintf(payload, sizeof(payload), "{\"flow_lpm\":%.3f,\"minutes\":%.2f}", flowRateLpm, totalMinutes);
+
+  if (mqttClient.publish("sensor/flow-rate-lpm", payload)) {
+    offlineAcc.totalTimeMs = 0;
+    offlineAcc.totalPulses = 0;
   }
-
-  String payload;
-  serializeJson(doc, payload);
-  mqttClient.publish("test-sensor", payload.c_str());
-  sensorReads.clear();
 }
 
 void setup() {
   Serial.begin(115200);
   pinMode(flowSensorPin, INPUT_PULLUP);
+  lastSampleTime = millis();
   attachInterrupt(digitalPinToInterrupt(flowSensorPin), increase, RISING);
+
   WiFi.begin(ssid, password);
   mqttClient.setServer(mqtt_server, 1883);
 }
 
 void loop() {
-  readAndStore();
+  readTotalTimeAndPulse();
+
+  wifiStatus();
+  mqttStatus();
+  
   publishSensorReads();
-  delay(500);
+  mqttClient.loop();
+
 }
