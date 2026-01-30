@@ -10,68 +10,85 @@ const char* mqtt_server = "";
 WiFiClient espClient;
 PubSubClient mqttClient(espClient);
 
-std::vector<int> sensorReads;
+const float millilitersPerPulse = 1000.0 / 60.0;
+const int flowSensorPin = 25;
 
-const int flowSensorPin = D2;
-volatile unsigned long pulse = 0;
+volatile unsigned long pulseAccumulator = 0;
+unsigned long lastSampleTime = 0;
+unsigned long lastPulseCount = 0;
 
 void IRAM_ATTR increase() {
-  pulse++;
+  pulseAccumulator++;
 }
 
 void wifiStatus() {
   if (WiFi.status() != WL_CONNECTED) {
     Serial.println("Connecting to WiFi");
-  }
-  else {
-    Serial.println("Connected");
+    if (WiFi.status() == WL_CONNECTED) {
+      Serial.println("WiFi connected");
+    }
   }
 }
 
 void mqttStatus() {
   if (WiFi.status() == WL_CONNECTED && !mqttClient.connected()) {
-    mqttClient.connect("test-sensor", "mqtt_indicator_1", "mqtt")
+    mqttClient.connect("test-sensor", "mqtt_indicator_1", "mqtt");
     Serial.println("Connecting to MQTT...");
-    if mqttClient.connected() {
+    if (mqttClient.connected()) {
       Serial.println("MQTT connected");
     }
   }
 }
 
-void readAndStore() {
+void readAndPublish() {
+  // Read Pulse and Time accumulate if Wi-Fi/MQTT is not ready.
+  if (millis() - lastSampleTime < 1000) return;
+
   noInterrupts();
-  unsigned int count = pulse;
-  pulse = 0;
+  unsigned long now = millis();
+  unsigned long pulses = pulseAccumulator;
   interrupts();
 
-  sensorReads.push_back(count);
-}
+  // Difference since last sample
+  unsigned long pulseDelta = pulses - lastPulseCount;
+  unsigned long timeDelta = now - lastSampleTime;
 
-void publishSensorReads() {
-  if (sensorReads.empty() || !mqttClient.connected()) return;
+  lastPulseCount += pulseDelta;
+  lastSampleTime += timeDelta;
 
-  StaticJsonDocument<256> doc;
-  JsonArray array = doc.to<JsonArray>();
-  for (int v : sensorReads) {
-    array.add(v);
+  // MQTT Client will automatically disconnect if ESP is not connected to WiFi
+  if (mqttClient.connected()) {
+
+    StaticJsonDocument<200> doc;
+    doc["Pulses"] = lastPulseCount;
+    doc["Millis"] = lastSampleTime;
+  
+    char buffer[200];
+    serializeJson(doc, buffer, sizeof(buffer));
+
+    if (mqttClient.publish("sensor/Pulses-Time", buffer)) {
+      lastPulseCount = pulses;
+      lastSampleTime = now;
+    }
   }
-
-  String payload;
-  serializeJson(doc, payload);
-  mqttClient.publish("test-sensor", payload.c_str());
-  sensorReads.clear();
 }
 
 void setup() {
   Serial.begin(115200);
   pinMode(flowSensorPin, INPUT_PULLUP);
+  lastSampleTime = millis();
   attachInterrupt(digitalPinToInterrupt(flowSensorPin), increase, RISING);
+
   WiFi.begin(ssid, password);
   mqttClient.setServer(mqtt_server, 1883);
 }
 
 void loop() {
-  readAndStore();
-  publishSensorReads();
-  delay(500);
+  mqttStatus();
+
+  readAndPublish();
+
+  wifiStatus();  
+  mqttClient.loop();
+
 }
